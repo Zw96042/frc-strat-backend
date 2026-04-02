@@ -19,6 +19,7 @@ class SourceSubmission(BaseModel):
     stored_path: Optional[str] = None
     requested_match_name: Optional[str] = None
     event_key: Optional[str] = None
+    calibration_preset_id: Optional[str] = None
 
 
 class JobLogEntry(BaseModel):
@@ -64,6 +65,14 @@ class CalibrationEnvelope(BaseModel):
     updated_at: float
     quality_checks: dict[str, Any] = Field(default_factory=dict)
     views: list[ViewCalibration]
+
+
+class CalibrationPreset(BaseModel):
+    id: str
+    name: str
+    created_at: float
+    updated_at: float
+    calibration: CalibrationEnvelope
 
 
 class DetectionRecord(BaseModel):
