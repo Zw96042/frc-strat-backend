@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import threading
 import time
 import urllib.parse
+import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,9 +20,18 @@ from tracking_service.calibration import (
     solve_view_homography,
     upgrade_legacy_landmarks,
 )
-from tracking_service.config import ARTIFACT_ROOT, DATA_ROOT, ensure_data_dirs
-from tracking_service.pipeline import process_job, rebuild_match_tracking
-from tracking_service.schemas import FieldLandmark, MatchLabelUpdate, SourceSubmission, ViewCalibration
+from tracking_service.config import ARTIFACT_ROOT, DATA_ROOT, TARGET_FPS, ensure_data_dirs
+from tracking_service.pipeline import process_job, resolve_source
+from tracking_service.schemas import (
+    CalibrationEnvelope,
+    CalibrationPreset,
+    FieldLandmark,
+    MatchArtifactSet,
+    MatchLabelUpdate,
+    MatchRecord,
+    SourceSubmission,
+    ViewCalibration,
+)
 from tracking_service.storage import TrackingStore
 from tracking_service.watchbot import WatchbotManager
 
@@ -70,6 +81,56 @@ def _mark_orphaned_running_jobs() -> None:
             "Marked as failed on startup because the previous backend process exited mid-run.",
             level="error",
         )
+
+
+def _resolve_preset_calibration(calibration_preset_id: str | None):
+    if not calibration_preset_id:
+        return None, load_default_calibration()
+
+    try:
+        preset = store.load_calibration_preset(calibration_preset_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Calibration preset not found.") from exc
+    return preset, preset.calibration
+
+
+def _create_match_draft(source: SourceSubmission) -> dict:
+    resolved = resolve_source(source)
+    preset, calibration = _resolve_preset_calibration(source.calibration_preset_id)
+
+    match = MatchRecord(
+        id=uuid.uuid4().hex,
+        created_at=time.time(),
+        updated_at=time.time(),
+        metadata={
+            "display_name": source.requested_match_name or Path(source.source_name).stem,
+            "status": "awaiting_calibration",
+            "fps": TARGET_FPS,
+            "source_kind": source.source_kind,
+            "start_mode": "ocr_gated" if source.source_kind == "watchbot" else "immediate",
+            "calibration_preset_id": preset.id if preset is not None else None,
+            "calibration_preset_name": preset.name if preset is not None else None,
+            "processing": False,
+        },
+        source={
+            "source_name": source.source_name,
+            "source_url": resolved.source_url,
+            "stored_path": source.stored_path,
+        },
+        calibration=calibration,
+        artifacts=MatchArtifactSet(),
+        debug={"stages": ["draft_created"]},
+    )
+
+    if source.stored_path:
+        copied_source = store.copy_into_artifacts(source.stored_path, match.id, "source")
+        if copied_source:
+            match.artifacts.source_video = copied_source
+    elif resolved.video_path.startswith("http"):
+        match.artifacts.source_video = resolved.video_path
+
+    store.save_match(match)
+    return match.model_dump()
 
 
 @app.on_event("startup")
@@ -123,16 +184,27 @@ async def delete_job(job_id: str) -> dict:
 async def create_source(payload: dict) -> dict:
     youtube_url = payload.get("youtube_url")
     match_name = payload.get("match_name")
+    calibration_preset_id = payload.get("calibration_preset_id")
+    calibrate_first = bool(payload.get("calibrate_first"))
 
     if not youtube_url:
         raise HTTPException(status_code=400, detail="Provide a youtube_url or use /sources/upload for local files.")
+    if calibration_preset_id:
+        try:
+            store.load_calibration_preset(str(calibration_preset_id))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Calibration preset not found.") from exc
 
     source = SourceSubmission(
         source_kind="youtube",
         source_name=match_name or "youtube-source",
         source_url=youtube_url,
         requested_match_name=match_name,
+        calibration_preset_id=calibration_preset_id,
     )
+
+    if calibrate_first:
+        return {"match": _create_match_draft(source)}
 
     job = store.create_job(source)
     store.append_job_log(job.id, "Job queued.")
@@ -144,10 +216,17 @@ async def create_source(payload: dict) -> dict:
 async def create_upload_source(request: Request) -> dict:
     upload_name = request.query_params.get("upload_name") or "upload.mp4"
     match_name = request.query_params.get("match_name")
+    calibration_preset_id = request.query_params.get("calibration_preset_id")
+    calibrate_first = request.query_params.get("calibrate_first") in {"1", "true", "yes"}
     upload_bytes = await request.body()
 
     if not upload_bytes:
         raise HTTPException(status_code=400, detail="Upload body is empty.")
+    if calibration_preset_id:
+        try:
+            store.load_calibration_preset(calibration_preset_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Calibration preset not found.") from exc
 
     upload_id, stored_path = store.save_upload(upload_name, upload_bytes)
     source = SourceSubmission(
@@ -155,7 +234,11 @@ async def create_upload_source(request: Request) -> dict:
         source_name=upload_name or f"upload-{upload_id}.mp4",
         stored_path=stored_path,
         requested_match_name=match_name,
+        calibration_preset_id=calibration_preset_id,
     )
+
+    if calibrate_first:
+        return {"match": _create_match_draft(source)}
 
     job = store.create_job(source)
     store.append_job_log(job.id, "Upload received and job queued.")
@@ -288,8 +371,64 @@ async def update_match_calibration(match_id: str, payload: dict) -> dict:
     match.calibration.updated_at = time.time()
     match.calibration.quality_checks = payload.get("quality_checks", match.calibration.quality_checks)
     match.calibration.views = [ViewCalibration.model_validate(view) for view in payload["views"]]
-    match = rebuild_match_tracking(match, store)
+    store.save_match(match)
     return match.calibration.model_dump()
+
+
+@app.post("/matches/{match_id}/start-processing")
+async def start_match_processing(match_id: str) -> dict:
+    try:
+        match = store.load_match(match_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Match not found.") from exc
+
+    if match.metadata.get("processing") is True:
+        raise HTTPException(status_code=409, detail="Match is already processing.")
+
+    source = SourceSubmission(
+        source_kind=str(match.metadata.get("source_kind") or "upload"),  # type: ignore[arg-type]
+        source_url=match.source.get("source_url") if isinstance(match.source, dict) else None,
+        source_name=str(match.source.get("source_name") if isinstance(match.source, dict) else match.id),
+        stored_path=match.source.get("stored_path") if isinstance(match.source, dict) else None,
+        requested_match_name=str(match.metadata.get("display_name") or match.id),
+        calibration_preset_id=str(match.metadata.get("calibration_preset_id") or "") or None,
+    )
+    job = store.create_job(source)
+    job.match_id = match.id
+    store.save_job(job)
+
+    match.metadata["status"] = "queued"
+    match.metadata["processing"] = False
+    store.save_match(match)
+
+    store.append_job_log(job.id, "Draft match queued for processing.")
+    threading.Thread(target=_run_job, args=(job.id,), daemon=True).start()
+    return {"job": job.model_dump(), "match": match.model_dump()}
+
+
+@app.get("/calibration-presets")
+async def list_calibration_presets() -> list[dict]:
+    return [preset.model_dump() for preset in store.list_calibration_presets()]
+
+
+@app.post("/calibration-presets")
+async def create_calibration_preset(payload: dict) -> dict:
+    name = str(payload.get("name") or "").strip()
+    calibration_payload = payload.get("calibration")
+    if not name:
+        raise HTTPException(status_code=400, detail="Calibration preset name is required.")
+    if not isinstance(calibration_payload, dict):
+        raise HTTPException(status_code=400, detail="Calibration preset requires a calibration payload.")
+
+    preset = CalibrationPreset(
+        id=uuid.uuid4().hex,
+        name=name,
+        created_at=time.time(),
+        updated_at=time.time(),
+        calibration=CalibrationEnvelope.model_validate(calibration_payload),
+    )
+    store.save_calibration_preset(preset)
+    return {"preset": preset.model_dump()}
 
 
 @app.put("/matches/{match_id}/labels")

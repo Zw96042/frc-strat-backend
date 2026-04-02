@@ -197,6 +197,40 @@ def points_form_valid_quad(points: list[list[float]], min_area_floor: float = 10
     return True
 
 
+def order_quad_indices(points: list[list[float]], invert_y: bool = False) -> list[int]:
+    if len(points) != 4:
+        return list(range(len(points)))
+
+    prepared = np.array(
+        [[float(point[0]), float(-point[1] if invert_y else point[1])] for point in points],
+        dtype=np.float32,
+    )
+    sums = prepared[:, 0] + prepared[:, 1]
+    diffs = prepared[:, 0] - prepared[:, 1]
+
+    top_left = int(np.argmin(sums))
+    bottom_right = int(np.argmax(sums))
+    top_right = int(np.argmax(diffs))
+    bottom_left = int(np.argmin(diffs))
+
+    order = [top_left, top_right, bottom_left, bottom_right]
+    seen: set[int] = set()
+    unique_order: list[int] = []
+    for index in order:
+        if index in seen:
+            continue
+        seen.add(index)
+        unique_order.append(index)
+    for index in range(len(points)):
+        if index not in seen:
+            unique_order.append(index)
+    return unique_order[:4]
+
+
+def order_quad_points(points: list[list[float]], invert_y: bool = False) -> list[list[float]]:
+    return [list(points[index]) for index in order_quad_indices(points, invert_y=invert_y)]
+
+
 def field_points_form_valid_quad(points: list[list[float]]) -> bool:
     return points_form_valid_quad(points)
 
@@ -269,7 +303,10 @@ def solve_view_homography(
         ]
         for landmark in landmarks[:4]
     ]
-    field_points = get_solve_field_points(view_name, landmarks)
+    order = order_quad_indices(relative_image_points)
+    relative_image_points = [relative_image_points[index] for index in order]
+    raw_field_points = get_solve_field_points(view_name, landmarks)
+    field_points = [raw_field_points[index] for index in order]
     return solve_homography(relative_image_points, field_points)
 
 
@@ -407,12 +444,33 @@ def project_detection_in_view(point: Tuple[float, float], view: ViewCalibration)
     return normalize_field_point(projected, view)
 
 
-def project_detection(point: Tuple[float, float], calibration: dict[str, ViewCalibration]) -> tuple[Optional[str], np.ndarray]:
+def project_detection_candidates(
+    point: Tuple[float, float],
+    calibration: dict[str, ViewCalibration],
+) -> list[tuple[str, np.ndarray]]:
+    candidates: list[tuple[str, np.ndarray]] = []
     for view_name in ("left", "main", "right"):
-        view = calibration[view_name]
-        if inside_roi(point, view.roi):
-            return view_name, project_detection_in_view(point, view)
-    return None, np.array([np.nan, np.nan], dtype=np.float32)
+        view = calibration.get(view_name)
+        if view is None or not inside_roi(point, view.roi):
+            continue
+        candidates.append((view_name, project_detection_in_view(point, view)))
+    return candidates
+
+
+def project_detection(point: Tuple[float, float], calibration: dict[str, ViewCalibration]) -> tuple[Optional[str], np.ndarray]:
+    candidates = project_detection_candidates(point, calibration)
+    if not candidates:
+        return None, np.array([np.nan, np.nan], dtype=np.float32)
+
+    valid_candidates = [
+        (view_name, field_point)
+        for view_name, field_point in candidates
+        if not np.isnan(field_point).any()
+    ]
+    if not valid_candidates:
+        return candidates[0]
+
+    return valid_candidates[0]
 
 
 def solve_homography(image_points: list[list[float]], field_points: list[list[float]]) -> tuple[list[list[float]], float]:

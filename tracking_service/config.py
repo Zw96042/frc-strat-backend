@@ -11,6 +11,7 @@ MATCH_ROOT = DATA_ROOT / "matches"
 JOB_ROOT = DATA_ROOT / "jobs"
 WATCHBOT_ROOT = DATA_ROOT / "watchbot"
 ARTIFACT_ROOT = DATA_ROOT / "artifacts"
+CALIBRATION_PRESET_ROOT = DATA_ROOT / "calibrations"
 DEFAULT_CALIBRATION_FILE = BACKEND_ROOT / "field_calibration.json"
 
 ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "EocOtkmJYz5Hlu7QosUB")
@@ -41,5 +42,6 @@ def ensure_data_dirs() -> None:
         JOB_ROOT,
         WATCHBOT_ROOT,
         ARTIFACT_ROOT,
+        CALIBRATION_PRESET_ROOT,
     ):
         path.mkdir(parents=True, exist_ok=True)

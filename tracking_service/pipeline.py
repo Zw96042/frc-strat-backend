@@ -23,7 +23,12 @@ try:
 except Exception:
     yt_dlp = None
 
-from .calibration import calibration_for_match, load_default_calibration, project_detection, project_detection_in_view
+from .calibration import (
+    calibration_for_match,
+    load_default_calibration,
+    project_detection_candidates,
+    project_detection_in_view,
+)
 from .config import (
     FIELD_HEIGHT_IN,
     FIELD_WIDTH_IN,
@@ -51,6 +56,9 @@ FIELD_IMAGE_SCALE_X = 1.365
 FIELD_IMAGE_SCALE_Y = 1.125
 FIELD_IMAGE_PATH = Path(__file__).resolve().parents[2] / "frontend" / "mais" / "public" / "2026_No-Fuel_Transparent.png"
 YOUTUBE_MIN_HEIGHT = 720
+ANNOTATION_DEFAULT_COLOR = (214, 224, 230)
+ANNOTATION_FUSED_COLOR = (180, 90, 255)
+ANNOTATION_FALLBACK_COLOR = (80, 210, 255)
 
 
 @dataclass
@@ -178,34 +186,53 @@ def fuse_field_detections(detections: list[dict]) -> list[dict]:
     if not detections:
         return []
 
-    used = [False] * len(detections)
     fused: list[dict] = []
 
-    for index, detection in enumerate(detections):
+    adjacency: list[set[int]] = [set() for _ in detections]
+    field_points = [
+        np.array(detection["field_point"], dtype=np.float32)
+        for detection in detections
+    ]
+
+    for index in range(len(detections)):
+        for candidate_index in range(index + 1, len(detections)):
+            distance = float(np.linalg.norm(field_points[index] - field_points[candidate_index]))
+            if distance <= MERGE_DISTANCE_IN:
+                adjacency[index].add(candidate_index)
+                adjacency[candidate_index].add(index)
+
+    used = [False] * len(detections)
+    for index in range(len(detections)):
         if used[index]:
             continue
 
-        cluster = [index]
+        cluster: list[int] = []
+        stack = [index]
         used[index] = True
-        anchor = np.array(detection["field_point"], dtype=np.float32)
-
-        for candidate_index in range(index + 1, len(detections)):
-            if used[candidate_index]:
-                continue
-            candidate = np.array(detections[candidate_index]["field_point"], dtype=np.float32)
-            if float(np.linalg.norm(anchor - candidate)) <= MERGE_DISTANCE_IN:
-                used[candidate_index] = True
-                cluster.append(candidate_index)
+        while stack:
+            current = stack.pop()
+            cluster.append(current)
+            for neighbor in adjacency[current]:
+                if used[neighbor]:
+                    continue
+                used[neighbor] = True
+                stack.append(neighbor)
 
         cluster_detections = [detections[item] for item in cluster]
-        field_points = np.array([item["field_point"] for item in cluster_detections], dtype=np.float32)
+        cluster_points = np.array([item["field_point"] for item in cluster_detections], dtype=np.float32)
+        weights = np.array(
+            [max(float(item["confidence"]), 1e-3) for item in cluster_detections],
+            dtype=np.float32,
+        )
+        weighted_point = np.average(cluster_points, axis=0, weights=weights)
+        primary_detection = max(cluster_detections, key=lambda item: float(item["confidence"]))
         fused.append(
             {
-                "field_point": np.mean(field_points, axis=0).tolist(),
+                "field_point": weighted_point.tolist(),
                 "confidence": float(max(item["confidence"] for item in cluster_detections)),
-                "view": cluster_detections[0]["view"],
+                "view": primary_detection["view"],
                 "source_views": sorted({item["view"] for item in cluster_detections}),
-                "source_detection_indices": cluster,
+                "source_detection_indices": sorted(cluster),
             }
         )
 
@@ -472,34 +499,63 @@ def process_job(job: JobRecord, store: TrackingStore) -> MatchRecord:
     job = store.append_job_log(job.id, source_ready_message)
     model = load_robot_model()
     job = store.append_job_log(job.id, f"Loaded robot model {ROBOT_MODEL_ID}")
+    existing_match: MatchRecord | None = None
+    if job.match_id:
+        try:
+            existing_match = store.load_match(job.match_id)
+        except FileNotFoundError:
+            existing_match = None
 
-    match_id = uuid.uuid4().hex
-    calibration = load_default_calibration()
-    match = MatchRecord(
-        id=match_id,
-        created_at=time.time(),
-        updated_at=time.time(),
-        metadata={
-            "display_name": job.source.requested_match_name or Path(job.source.source_name).stem,
-            "status": "processing",
-            "fps": TARGET_FPS,
-            "source_kind": job.source.source_kind,
-            "start_mode": "ocr_gated" if job.source.source_kind == "watchbot" else "immediate",
-        },
-        source={
-            "source_name": job.source.source_name,
-            "source_url": resolved.source_url,
-            "stored_path": job.source.stored_path,
-        },
-        calibration=calibration,
-        artifacts=MatchArtifactSet(),
-        debug={"stages": []},
-    )
+    if existing_match is not None:
+        match = existing_match
+        match.metadata["status"] = "processing"
+        match.metadata["processing"] = True
+        match.metadata["fps"] = TARGET_FPS
+        match.source.update(
+            {
+                "source_name": job.source.source_name,
+                "source_url": resolved.source_url,
+                "stored_path": job.source.stored_path,
+            }
+        )
+        match.detections = []
+        match.tracks = []
+        match.debug = {"stages": []}
+    else:
+        match_id = uuid.uuid4().hex
+        calibration_preset = None
+        if job.source.calibration_preset_id:
+            calibration_preset = store.load_calibration_preset(job.source.calibration_preset_id)
+        calibration = calibration_preset.calibration if calibration_preset is not None else load_default_calibration()
+        match = MatchRecord(
+            id=match_id,
+            created_at=time.time(),
+            updated_at=time.time(),
+            metadata={
+                "display_name": job.source.requested_match_name or Path(job.source.source_name).stem,
+                "status": "processing",
+                "fps": TARGET_FPS,
+                "source_kind": job.source.source_kind,
+                "start_mode": "ocr_gated" if job.source.source_kind == "watchbot" else "immediate",
+                "calibration_preset_id": calibration_preset.id if calibration_preset is not None else None,
+                "calibration_preset_name": calibration_preset.name if calibration_preset is not None else None,
+            },
+            source={
+                "source_name": job.source.source_name,
+                "source_url": resolved.source_url,
+                "stored_path": job.source.stored_path,
+            },
+            calibration=calibration,
+            artifacts=MatchArtifactSet(),
+            debug={"stages": []},
+        )
 
     artifact_dir = store.create_match_artifact_dir(match.id)
     copied_source = store.copy_into_artifacts(job.source.stored_path, match.id, "source") if job.source.stored_path else None
     if copied_source:
         match.artifacts.source_video = copied_source
+    elif match.artifacts.source_video is None and resolved.video_path.startswith("http"):
+        match.artifacts.source_video = resolved.video_path
 
     cap = cv2.VideoCapture(resolved.video_path)
     if not cap.isOpened():
@@ -602,31 +658,37 @@ def process_job(job: JobRecord, store: TrackingStore) -> MatchRecord:
             )
 
             point = (center_x, center_y)
-            view, field_point = project_detection(point, calibration_map)
-            if view is None or np.isnan(field_point).any() or not is_reasonable_field_point(field_point):
+            projected_candidates = [
+                (view, field_point)
+                for view, field_point in project_detection_candidates(point, calibration_map)
+                if not np.isnan(field_point).any() and is_reasonable_field_point(field_point)
+            ]
+            if not projected_candidates:
                 continue
-
-            record = DetectionRecord(
-                frame=frame_id,
-                time=timestamp,
-                view=view,
-                source_confidence=confidence,
-                image_anchor=[center_x, center_y],
-                field_point=[float(field_point[0]), float(field_point[1])],
-                bbox=[float(v) for v in bbox] if bbox else None,
-            )
-            match.detections.append(record)
-            boxes_to_draw[-1]["global_detection_index"] = len(match.detections) - 1
-            projected_detections.append(
-                {
-                    "view": view,
-                    "field_point": record.field_point,
-                    "confidence": confidence,
-                    "bbox": record.bbox,
-                    "image_anchor": record.image_anchor,
-                    "global_detection_index": len(match.detections) - 1,
-                }
-            )
+            for candidate_index, (view, field_point) in enumerate(projected_candidates):
+                record = DetectionRecord(
+                    frame=frame_id,
+                    time=timestamp,
+                    view=view,
+                    source_confidence=confidence,
+                    image_anchor=[center_x, center_y],
+                    field_point=[float(field_point[0]), float(field_point[1])],
+                    bbox=[float(v) for v in bbox] if bbox else None,
+                )
+                match.detections.append(record)
+                global_detection_index = len(match.detections) - 1
+                if candidate_index == 0:
+                    boxes_to_draw[-1]["global_detection_index"] = global_detection_index
+                projected_detections.append(
+                    {
+                        "view": view,
+                        "field_point": record.field_point,
+                        "confidence": confidence,
+                        "bbox": record.bbox,
+                        "image_anchor": record.image_anchor,
+                        "global_detection_index": global_detection_index,
+                    }
+                )
 
         fused = fuse_field_detections(projected_detections)
         online_tracks = tracker.update(fused)
@@ -691,7 +753,10 @@ def process_job(job: JobRecord, store: TrackingStore) -> MatchRecord:
             )
 
         detection_to_track_ids: dict[int, list[int]] = {}
+        fused_track_ids: set[int] = set()
         for track in online_tracks:
+            if len(set(track.source_views)) > 1:
+                fused_track_ids.add(track.track_id)
             for detection_index in to_global_detection_indices(track.source_detection_indices, projected_detections):
                 detection_to_track_ids.setdefault(detection_index, []).append(track.track_id)
 
@@ -705,44 +770,49 @@ def process_job(job: JobRecord, store: TrackingStore) -> MatchRecord:
             detection_index = box["global_detection_index"]
             track_ids = detection_to_track_ids.get(detection_index, []) if detection_index is not None else []
             label = f"robot {confidence:.2f}"
+            color = ANNOTATION_DEFAULT_COLOR
             if track_ids:
-                label = f"T{track_ids[0]} {confidence:.2f}"
+                primary_track_id = track_ids[0]
+                is_fused = primary_track_id in fused_track_ids
+                color = ANNOTATION_FUSED_COLOR if is_fused else ANNOTATION_DEFAULT_COLOR
+                label = f"T{primary_track_id}{' FUSED' if is_fused else ''} {confidence:.2f}"
 
-            cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (214, 224, 230), 2)
+            cv2.rectangle(debug_frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
                 debug_frame,
                 label,
                 (x1, max(18, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
-                (214, 224, 230),
+                color,
                 1,
             )
         for fallback in image_fallback_tracks:
             x1, y1, x2, y2 = [int(round(value)) for value in fallback.bbox]
-            cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (80, 210, 255), 2)
+            cv2.rectangle(debug_frame, (x1, y1), (x2, y2), ANNOTATION_FALLBACK_COLOR, 2)
             cv2.putText(
                 debug_frame,
                 f"T{fallback.track_id} TRACK",
                 (x1, max(18, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
-                (80, 210, 255),
+                ANNOTATION_FALLBACK_COLOR,
                 1,
             )
         for track in online_tracks:
+            track_color = ANNOTATION_FUSED_COLOR if track.track_id in fused_track_ids else ANNOTATION_DEFAULT_COLOR
             cv2.putText(
                 debug_frame,
-                f"T{track.track_id}",
+                f"T{track.track_id}{' FUSED' if track.track_id in fused_track_ids else ''}",
                 (20, 40 + (track.track_id % 10) * 24),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
-                (224, 230, 236),
+                track_color,
                 2,
             )
         cv2.putText(
             debug_frame,
-            f"dets:{len(boxes_to_draw)} projected:{len(projected_detections)} tracks:{len(online_tracks)} motion:{len(image_fallback_tracks)}",
+            f"dets:{len(boxes_to_draw)} projected:{len(projected_detections)} tracks:{len(online_tracks)} fused:{len(fused_track_ids)} motion:{len(image_fallback_tracks)}",
             (20, height - 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,

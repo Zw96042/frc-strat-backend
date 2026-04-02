@@ -7,8 +7,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from .config import ARTIFACT_ROOT, JOB_ROOT, MATCH_ROOT, UPLOAD_ROOT, WATCHBOT_ROOT, ensure_data_dirs
-from .schemas import JobLogEntry, JobRecord, MatchRecord, SourceSubmission, WatchbotState
+from .config import ARTIFACT_ROOT, CALIBRATION_PRESET_ROOT, JOB_ROOT, MATCH_ROOT, UPLOAD_ROOT, WATCHBOT_ROOT, ensure_data_dirs
+from .schemas import CalibrationPreset, JobLogEntry, JobRecord, MatchRecord, SourceSubmission, WatchbotState
 
 
 class TrackingStore:
@@ -23,6 +23,9 @@ class TrackingStore:
 
     def _watchbot_path(self) -> Path:
         return WATCHBOT_ROOT / "state.json"
+
+    def _calibration_preset_path(self, preset_id: str) -> Path:
+        return CALIBRATION_PRESET_ROOT / f"{preset_id}.json"
 
     def save_upload(self, source_name: str, data: bytes) -> tuple[str, str]:
         ext = Path(source_name).suffix or ".mp4"
@@ -99,6 +102,18 @@ class TrackingStore:
         path = ARTIFACT_ROOT / match_id
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def save_calibration_preset(self, preset: CalibrationPreset) -> None:
+        preset.updated_at = time.time()
+        self._calibration_preset_path(preset.id).write_text(preset.model_dump_json(indent=2))
+
+    def load_calibration_preset(self, preset_id: str) -> CalibrationPreset:
+        return CalibrationPreset.model_validate_json(self._calibration_preset_path(preset_id).read_text())
+
+    def list_calibration_presets(self) -> list[CalibrationPreset]:
+        presets = [CalibrationPreset.model_validate_json(path.read_text()) for path in CALIBRATION_PRESET_ROOT.glob("*.json")]
+        presets.sort(key=lambda item: item.updated_at, reverse=True)
+        return presets
 
     def save_watchbot_state(self, state: WatchbotState) -> None:
         self._watchbot_path().write_text(state.model_dump_json(indent=2))
