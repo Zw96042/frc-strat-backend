@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -19,6 +20,13 @@ from tracking_service.calibration import (
     upgrade_legacy_landmarks,
 )
 from tracking_service.config import ARTIFACT_ROOT, DATA_ROOT, ensure_data_dirs
+from tracking_service.fuel import (
+    invalidate_fuel_analysis,
+    normalize_quad,
+    normalize_rgb_color,
+    run_fuel_analysis,
+    sample_match_video_color,
+)
 from tracking_service.pipeline import process_job, rebuild_match_tracking
 from tracking_service.schemas import FieldLandmark, MatchLabelUpdate, SourceSubmission, ViewCalibration
 from tracking_service.storage import TrackingStore
@@ -301,6 +309,153 @@ async def update_match_labels(match_id: str, payload: MatchLabelUpdate) -> dict:
     match.labels = payload.labels
     store.save_match(match)
     return {"labels": match.labels}
+
+
+@app.get("/matches/{match_id}/fuel")
+async def get_match_fuel(match_id: str) -> dict:
+    try:
+        match = store.load_match(match_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Match not found.") from exc
+    return {
+        "match_id": match.id,
+        "fuel_calibration": match.fuel_calibration.model_dump(),
+        "fuel_analysis": match.fuel_analysis.model_dump(),
+    }
+
+
+@app.get("/matches/{match_id}/fuel-calibration")
+async def get_match_fuel_calibration(match_id: str) -> dict:
+    try:
+        match = store.load_match(match_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Match not found.") from exc
+    return match.fuel_calibration.model_dump()
+
+
+@app.put("/matches/{match_id}/fuel-calibration")
+async def update_match_fuel_calibration(match_id: str, payload: dict) -> dict:
+    try:
+        match = store.load_match(match_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Match not found.") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Fuel calibration payload must be a JSON object.")
+
+    quad_labels = {
+        "ground_quad": "ground corners",
+        "left_wall_quad": "left wall",
+        "right_wall_quad": "right wall",
+    }
+    for field_name, label in quad_labels.items():
+        if field_name not in payload:
+            continue
+        value = payload[field_name]
+        if value is None:
+            setattr(match.fuel_calibration, field_name, None)
+            continue
+        normalized = normalize_quad(value)
+        if normalized is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Fuel calibration for {label} must be four normalized points inside the video frame that form a valid quadrilateral.",
+            )
+        setattr(match.fuel_calibration, field_name, normalized)
+
+    if "fuel_base_color" in payload:
+        normalized_color = normalize_rgb_color(payload.get("fuel_base_color"))
+        if normalized_color is None:
+            raise HTTPException(status_code=400, detail="fuel_base_color must be a list like [255, 255, 0].")
+        match.fuel_calibration.fuel_base_color = normalized_color
+
+    match.fuel_calibration.updated_at = time.time()
+    invalidate_fuel_analysis(match)
+    store.save_match(match)
+    return match.fuel_calibration.model_dump()
+
+
+@app.put("/matches/{match_id}/fuel/base-color")
+async def update_match_fuel_base_color(match_id: str, payload: dict) -> dict:
+    try:
+        match = store.load_match(match_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Match not found.") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Fuel base color payload must be a JSON object.")
+
+    normalized_color = normalize_rgb_color(payload.get("fuel_base_color"))
+    if normalized_color is None:
+        color_object = payload.get("fuelBaseColor")
+        if isinstance(color_object, dict):
+            normalized_color = normalize_rgb_color(
+                [color_object.get("r"), color_object.get("g"), color_object.get("b")]
+            )
+    if normalized_color is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide fuel_base_color as [r, g, b] or fuelBaseColor as { r, g, b }.",
+        )
+
+    match.fuel_calibration.fuel_base_color = normalized_color
+    match.fuel_calibration.updated_at = time.time()
+    invalidate_fuel_analysis(match)
+    store.save_match(match)
+    return {
+        "fuel_base_color": match.fuel_calibration.fuel_base_color,
+        "fuel_calibration": match.fuel_calibration.model_dump(),
+    }
+
+
+@app.post("/matches/{match_id}/fuel/base-color/sample")
+async def sample_match_fuel_base_color(match_id: str, payload: dict) -> dict:
+    try:
+        match = store.load_match(match_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Match not found.") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Fuel color sample payload must be a JSON object.")
+
+    x = payload.get("x")
+    y = payload.get("y")
+    time_sec = payload.get("time_sec", payload.get("timeSec", 0.0))
+    if not isinstance(x, (int, float)) or not isinstance(y, (int, float)) or not isinstance(time_sec, (int, float)):
+        raise HTTPException(status_code=400, detail="x, y, and time_sec must be numeric.")
+
+    try:
+        sampled_color = sample_match_video_color(match, float(x), float(y), float(time_sec))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    match.fuel_calibration.fuel_base_color = sampled_color
+    match.fuel_calibration.updated_at = time.time()
+    invalidate_fuel_analysis(match)
+    store.save_match(match)
+    return {
+        "fuel_base_color": sampled_color,
+        "fuel_calibration": match.fuel_calibration.model_dump(),
+    }
+
+
+@app.post("/matches/{match_id}/fuel/process")
+async def process_match_fuel(match_id: str) -> dict:
+    try:
+        match = store.load_match(match_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Match not found.") from exc
+
+    try:
+        match = await asyncio.to_thread(run_fuel_analysis, match, store)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "match_id": match.id,
+        "fuel_calibration": match.fuel_calibration.model_dump(),
+        "fuel_analysis": match.fuel_analysis.model_dump(),
+    }
 
 
 @app.get("/tba/team/{team_key}/matches")

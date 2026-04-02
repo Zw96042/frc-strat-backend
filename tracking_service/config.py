@@ -12,6 +12,9 @@ JOB_ROOT = DATA_ROOT / "jobs"
 WATCHBOT_ROOT = DATA_ROOT / "watchbot"
 ARTIFACT_ROOT = DATA_ROOT / "artifacts"
 DEFAULT_CALIBRATION_FILE = BACKEND_ROOT / "field_calibration.json"
+FUEL_DENSITY_MAP_ROOT = Path(os.getenv("FUEL_DENSITY_MAP_ROOT", str(BACKEND_ROOT.parent / "fuel-density-map"))).resolve()
+FUEL_PROCESSOR_SCRIPT = FUEL_DENSITY_MAP_ROOT / "processor_cli.py"
+FUEL_FIELD_IMAGE_PATH = FUEL_DENSITY_MAP_ROOT / "webui" / "public" / "assets" / "rebuilt-field.png"
 
 ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "EocOtkmJYz5Hlu7QosUB")
 ROBOT_MODEL_ID = os.getenv("ROBOT_MODEL_ID", "bumpers-detection-v2/3")
@@ -35,11 +38,11 @@ MOTION_TRACKER_MIN_BOX_SIZE_PX = float(os.getenv("TRACKING_MOTION_MIN_BOX_SIZE_P
 
 def ensure_data_dirs() -> None:
     for path in (
-        DATA_ROOT,
-        UPLOAD_ROOT,
-        MATCH_ROOT,
-        JOB_ROOT,
-        WATCHBOT_ROOT,
-        ARTIFACT_ROOT,
+    DATA_ROOT,
+    UPLOAD_ROOT,
+    MATCH_ROOT,
+    JOB_ROOT,
+    WATCHBOT_ROOT,
+    ARTIFACT_ROOT,
     ):
         path.mkdir(parents=True, exist_ok=True)

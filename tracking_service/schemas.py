@@ -9,6 +9,7 @@ CalibrationMode = Literal["auto_calibration", "manual_override", "blended", "man
 JobStatus = Literal["queued", "running", "completed", "failed"]
 SourceKind = Literal["upload", "youtube", "watchbot"]
 ViewName = Literal["left", "main", "right"]
+FuelAnalysisStatus = Literal["idle", "ready", "processing", "completed", "error"]
 
 
 class SourceSubmission(BaseModel):
@@ -99,6 +100,42 @@ class MatchArtifactSet(BaseModel):
     debug_snapshot: Optional[str] = None
 
 
+class FuelCalibration(BaseModel):
+    ground_quad: Optional[list[list[float]]] = None
+    left_wall_quad: Optional[list[list[float]]] = None
+    right_wall_quad: Optional[list[list[float]]] = None
+    fuel_base_color: list[int] = Field(default_factory=lambda: [255, 255, 0])
+    updated_at: Optional[float] = None
+
+
+class FuelArtifactSet(BaseModel):
+    overlay_image: Optional[str] = None
+    overlay_transparent_image: Optional[str] = None
+    overlay_video: Optional[str] = None
+    raw_data: Optional[str] = None
+    field_map: Optional[str] = None
+    air_profile: Optional[str] = None
+    stats_file: Optional[str] = None
+    process_log: Optional[str] = None
+
+
+class FuelProcessingProgress(BaseModel):
+    phase: str
+    current: int
+    total: int
+    started_at: float
+    updated_at: float
+
+
+class FuelAnalysisRecord(BaseModel):
+    status: FuelAnalysisStatus = "idle"
+    artifacts: FuelArtifactSet = Field(default_factory=FuelArtifactSet)
+    stats: dict[str, Any] = Field(default_factory=dict)
+    last_error: Optional[str] = None
+    processing_progress: Optional[FuelProcessingProgress] = None
+    updated_at: Optional[float] = None
+
+
 class MatchLabelUpdate(BaseModel):
     labels: dict[str, str]
 
@@ -113,6 +150,8 @@ class MatchRecord(BaseModel):
     detections: list[DetectionRecord] = Field(default_factory=list)
     tracks: list[TrackRecord] = Field(default_factory=list)
     artifacts: MatchArtifactSet = Field(default_factory=MatchArtifactSet)
+    fuel_calibration: FuelCalibration = Field(default_factory=FuelCalibration)
+    fuel_analysis: FuelAnalysisRecord = Field(default_factory=FuelAnalysisRecord)
     labels: dict[str, str] = Field(default_factory=dict)
     debug: dict[str, Any] = Field(default_factory=dict)
 
