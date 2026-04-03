@@ -16,13 +16,13 @@ class WatchbotManager:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
-    def start(self, stream_url: str) -> WatchbotState:
+    def start(self, stream_url: str, calibration_preset_id: str | None = None) -> WatchbotState:
         state = WatchbotState(
             active=True,
             stream_url=stream_url,
             started_at=time.time(),
             updated_at=time.time(),
-            last_message="Watchbot starting.",
+            last_message="Watchbot armed with template start detection.",
             capture_directory=str((Path(__file__).resolve().parent.parent / "data" / "watchbot").resolve()),
         )
         self.store.save_watchbot_state(state)
@@ -47,6 +47,7 @@ class WatchbotManager:
                 source_name=capture_path.name,
                 stored_path=str(capture_path),
                 requested_match_name=f"Watchbot Capture {capture_path.stem}",
+                calibration_preset_id=calibration_preset_id,
             )
             job = self.store.create_job(source)
             self.store.append_job_log(job.id, "Watchbot captured a match segment and enqueued processing.")

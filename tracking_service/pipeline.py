@@ -1,22 +1,18 @@
 from __future__ import annotations
 
+import json
 import os
-import re
 import subprocess
 import tempfile
 import time
 import uuid
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
 import cv2
 import numpy as np
-
-try:
-    import pytesseract
-except Exception:
-    pytesseract = None
 
 try:
     import yt_dlp
@@ -34,16 +30,22 @@ from .config import (
     FIELD_WIDTH_IN,
     MERGE_DISTANCE_IN,
     MOTION_TRACKER_ALGORITHM,
-    OCR_INTERVAL_SECONDS,
-    OCR_TIMEOUT_SECONDS,
     ROBOFLOW_API_KEY,
     ROBOT_MODEL_ID,
     TARGET_FPS,
+    WATCHBOT_FIELD_TEMPLATE_MARGIN,
+    WATCHBOT_FIELD_TEMPLATE_ROIS,
+    WATCHBOT_FIELD_TEMPLATE_ROOT,
+    WATCHBOT_FIELD_TEMPLATE_SIZE,
+    WATCHBOT_MATCH_DURATION_SECONDS,
+    WATCHBOT_TEMPLATE_ANALYSIS_FPS,
+    WATCHBOT_TEMPLATE_START_FRAMES,
 )
 from .image_tracker import ImageTrackObservation, ImageTrackerManager
 from .schemas import CalibrationEnvelope, DetectionRecord, JobRecord, MatchArtifactSet, MatchRecord, SourceSubmission, TrackRecord
 from .storage import TrackingStore
 from .tracker import FieldTracker
+from .watchbot_templates import WatchbotStartDetector
 
 try:
     from inference import get_model
@@ -51,10 +53,19 @@ except Exception:
     get_model = None
 
 
-TIMER_PATTERN = re.compile(r"(\d{1,2})[:.](\d{2})")
 FIELD_IMAGE_SCALE_X = 1.365
 FIELD_IMAGE_SCALE_Y = 1.125
-FIELD_IMAGE_PATH = Path(__file__).resolve().parents[2] / "frontend" / "mais" / "public" / "2026_No-Fuel_Transparent.png"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FIELD_IMAGE_PATH = next(
+    (
+        candidate for candidate in (
+            REPO_ROOT / "frc-strat-frontend" / "public" / "2026_No-Fuel_Transparent.png",
+            REPO_ROOT / "frontend" / "mais" / "public" / "2026_No-Fuel_Transparent.png",
+        )
+        if candidate.exists()
+    ),
+    REPO_ROOT / "frc-strat-frontend" / "public" / "2026_No-Fuel_Transparent.png",
+)
 YOUTUBE_MIN_HEIGHT = 720
 ANNOTATION_DEFAULT_COLOR = (214, 224, 230)
 ANNOTATION_FUSED_COLOR = (180, 90, 255)
@@ -67,6 +78,23 @@ class ResolvedSource:
     display_name: str
     source_url: Optional[str]
     stream_height: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ParsedMatchClip:
+    path: str
+    index: int
+    started_at_seconds: float
+    ended_at_seconds: float
+
+
+@lru_cache(maxsize=1)
+def _load_watchbot_start_detector() -> WatchbotStartDetector:
+    return WatchbotStartDetector(
+        dataset_root=WATCHBOT_FIELD_TEMPLATE_ROOT,
+        rois=WATCHBOT_FIELD_TEMPLATE_ROIS,
+        template_size=WATCHBOT_FIELD_TEMPLATE_SIZE,
+    )
 
 
 def _youtube_format_sort_key(fmt: dict) -> tuple[int, int, int, int, int, float, int, float]:
@@ -86,6 +114,59 @@ def _youtube_format_sort_key(fmt: dict) -> tuple[int, int, int, int, int, float,
     has_audio = 1 if acodec not in {"", "none"} else 0
 
     return (meets_target, non_hls, mp4_container, codec_score, height, fps, has_audio, tbr)
+
+
+def _normalize_video_url(url: str) -> str:
+    return (
+        url.strip()
+        .replace("\\?", "?")
+        .replace("\\&", "&")
+        .replace("\\=", "=")
+    )
+
+
+def _looks_like_youtube_url(url: str) -> bool:
+    lowered = url.lower()
+    return "youtube.com" in lowered or "youtu.be" in lowered
+
+
+def _resolve_youtube_with_python(url: str) -> tuple[Optional[str], Optional[int], str]:
+    if yt_dlp is None:
+        raise RuntimeError("Python yt-dlp is unavailable.")
+
+    ydl_opts = {
+        "quiet": True,
+        "noplaylist": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        raise RuntimeError(f"Python yt-dlp extraction failed: {exc}") from exc
+
+    stream_url, stream_height = _select_youtube_stream(info)
+    display_name = str(info.get("title") or "YouTube stream")
+    return stream_url, stream_height, display_name
+
+
+def _resolve_youtube_with_cli(url: str) -> tuple[Optional[str], Optional[int], str]:
+    command = ["yt-dlp", "--dump-single-json", "--no-playlist", url]
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("yt-dlp CLI is not installed or not on PATH.") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        raise RuntimeError(f"yt-dlp CLI failed: {stderr or exc}") from exc
+
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"yt-dlp CLI returned invalid JSON: {exc}") from exc
+
+    stream_url, stream_height = _select_youtube_stream(info)
+    display_name = str(info.get("title") or "YouTube stream")
+    return stream_url, stream_height, display_name
 
 
 def _select_youtube_stream(info: dict) -> tuple[Optional[str], Optional[int]]:
@@ -111,65 +192,145 @@ def resolve_source(source: SourceSubmission) -> ResolvedSource:
         return ResolvedSource(video_path=source.stored_path, display_name=source.source_name, source_url=None)
 
     if source.source_kind in {"youtube", "watchbot"} and source.source_url:
-        if source.source_url.startswith("http"):
-            if yt_dlp is None:
-                raise RuntimeError("yt-dlp is required to resolve YouTube sources.")
-            ydl_opts = {
-                "quiet": True,
-                "noplaylist": True,
-            }
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(source.source_url, download=False)
-            except Exception as exc:
-                raise RuntimeError(f"Could not resolve the YouTube source: {exc}") from exc
+        normalized_url = _normalize_video_url(source.source_url)
+        if normalized_url.startswith("http"):
+            if _looks_like_youtube_url(normalized_url):
+                errors: list[str] = []
+                for resolver in (_resolve_youtube_with_python, _resolve_youtube_with_cli):
+                    try:
+                        stream_url, stream_height, display_name = resolver(normalized_url)
+                        if not stream_url:
+                            raise RuntimeError("Resolver returned no playable stream URL.")
+                        return ResolvedSource(
+                            video_path=stream_url,
+                            display_name=display_name or source.source_name,
+                            source_url=normalized_url,
+                            stream_height=stream_height,
+                        )
+                    except Exception as exc:
+                        errors.append(str(exc))
+                raise RuntimeError("Could not resolve the YouTube source. " + " | ".join(errors))
 
-            stream_url, stream_height = _select_youtube_stream(info)
-            if not stream_url:
-                raise RuntimeError("yt-dlp resolved the source but did not return a playable stream URL.")
-
-            display_name = info.get("title") or source.source_name
             return ResolvedSource(
-                video_path=stream_url,
-                display_name=display_name,
-                source_url=source.source_url,
-                stream_height=stream_height,
+                video_path=normalized_url,
+                display_name=source.source_name,
+                source_url=normalized_url,
+                stream_height=None,
             )
 
     raise ValueError("Unsupported source submission.")
 
 
-def read_match_timer(frame: np.ndarray, last_ocr_time: float) -> tuple[Optional[int], float]:
-    if pytesseract is None:
-        return None, last_ocr_time
-    now = time.time()
-    if now - last_ocr_time < OCR_INTERVAL_SECONDS:
-        return None, last_ocr_time
+def parse_source_into_match_clips(
+    source: SourceSubmission,
+    output_dir: Path,
+    stop_flag=None,
+    log_callback=None,
+) -> tuple[ResolvedSource, list[ParsedMatchClip]]:
+    resolved = resolve_source(source)
+    cap = cv2.VideoCapture(resolved.video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open the parsed stream source.")
 
-    height, width, _ = frame.shape
-    roi = frame[int(height * 0.02):int(height * 0.12), int(width * 0.35):int(width * 0.65)]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=2, fy=2)
-    _, gray = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+    detector = _load_watchbot_start_detector()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if source_fps <= 0:
+        source_fps = TARGET_FPS
+    analysis_stride = 1
+    if WATCHBOT_TEMPLATE_ANALYSIS_FPS > 0:
+        analysis_stride = max(1, int(round(source_fps / WATCHBOT_TEMPLATE_ANALYSIS_FPS)))
+    clip_frame_count = max(1, int(round(WATCHBOT_MATCH_DURATION_SECONDS * source_fps)))
+
+    clips: list[ParsedMatchClip] = []
+    writer = None
+    clip_index = 1
+    frame_id = 0
+    clip_start_frame: Optional[int] = None
+    clip_end_frame: Optional[int] = None
+    current_path: Optional[Path] = None
+    positive_streak = 0
+
     try:
-        text = pytesseract.image_to_string(
-            gray,
-            config="--psm 7 -c tessedit_char_whitelist=0123456789:",
-            timeout=OCR_TIMEOUT_SECONDS,
-        )
-    except RuntimeError as exc:
-        if "timeout" in str(exc).lower():
-            return None, now
-        raise
-    match = TIMER_PATTERN.search(text)
-    if not match:
-        return None, now
-    minutes = int(match.group(1))
-    seconds = int(match.group(2))
-    total = minutes * 60 + seconds
-    if total > 180:
-        return None, now
-    return total, now
+        while True:
+            if stop_flag is not None and stop_flag():
+                break
+
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+
+            wrote_current_frame = False
+            if writer is None and frame_id % analysis_stride == 0:
+                start_margin = detector.score_frame(frame)
+                if start_margin >= WATCHBOT_FIELD_TEMPLATE_MARGIN:
+                    positive_streak += 1
+                else:
+                    positive_streak = 0
+
+                if positive_streak >= WATCHBOT_TEMPLATE_START_FRAMES:
+                    height, width = frame.shape[:2]
+                    current_path = output_dir / f"match_{clip_index:03d}.mp4"
+                    writer = cv2.VideoWriter(
+                        str(current_path),
+                        cv2.VideoWriter_fourcc(*"mp4v"),
+                        source_fps,
+                        (width, height),
+                    )
+                    if not writer.isOpened():
+                        raise RuntimeError(f"Could not create parsed clip: {current_path}")
+                    clip_start_frame = frame_id
+                    clip_end_frame = frame_id + clip_frame_count - 1
+                    writer.write(frame)
+                    wrote_current_frame = True
+                    if log_callback is not None:
+                        log_callback(
+                            f"Detected match {clip_index:03d} at {frame_id / source_fps:.1f}s; clipping {WATCHBOT_MATCH_DURATION_SECONDS:.0f}s."
+                        )
+
+            if writer is not None:
+                if not wrote_current_frame:
+                    writer.write(frame)
+                if clip_end_frame is not None and frame_id >= clip_end_frame:
+                    writer.release()
+                    writer = None
+                    assert current_path is not None and clip_start_frame is not None
+                    ended_at_seconds = frame_id / source_fps
+                    clips.append(
+                        ParsedMatchClip(
+                            path=str(current_path),
+                            index=clip_index,
+                            started_at_seconds=clip_start_frame / source_fps,
+                            ended_at_seconds=ended_at_seconds,
+                        )
+                    )
+                    if log_callback is not None:
+                        log_callback(
+                            f"Saved match {clip_index:03d} clip ({clip_start_frame / source_fps:.1f}s to {ended_at_seconds:.1f}s)."
+                        )
+                    clip_index += 1
+                    current_path = None
+                    clip_start_frame = None
+                    clip_end_frame = None
+                    positive_streak = 0
+
+            frame_id += 1
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+            if current_path is not None and clip_start_frame is not None:
+                clips.append(
+                    ParsedMatchClip(
+                        path=str(current_path),
+                        index=clip_index,
+                        started_at_seconds=clip_start_frame / source_fps,
+                        ended_at_seconds=max(frame_id - 1, clip_start_frame) / source_fps,
+                    )
+                )
+
+    return resolved, clips
 
 
 def load_robot_model():
@@ -511,6 +672,7 @@ def process_job(job: JobRecord, store: TrackingStore) -> MatchRecord:
         match.metadata["status"] = "processing"
         match.metadata["processing"] = True
         match.metadata["fps"] = TARGET_FPS
+        match.metadata["start_mode"] = "template_clipped" if job.source.source_kind == "watchbot" else "immediate"
         match.source.update(
             {
                 "source_name": job.source.source_name,
@@ -536,7 +698,7 @@ def process_job(job: JobRecord, store: TrackingStore) -> MatchRecord:
                 "status": "processing",
                 "fps": TARGET_FPS,
                 "source_kind": job.source.source_kind,
-                "start_mode": "ocr_gated" if job.source.source_kind == "watchbot" else "immediate",
+                "start_mode": "template_clipped" if job.source.source_kind == "watchbot" else "immediate",
                 "calibration_preset_id": calibration_preset.id if calibration_preset is not None else None,
                 "calibration_preset_name": calibration_preset.name if calibration_preset is not None else None,
             },
@@ -579,22 +741,21 @@ def process_job(job: JobRecord, store: TrackingStore) -> MatchRecord:
 
     frame_id = 0
     last_processed_time = -frame_interval
-    last_ocr_time = 0.0
     last_progress_log_time = time.time()
     last_progress_log_frame = 0
-    use_ocr_gating = job.source.source_kind == "watchbot"
-    match_active = not use_ocr_gating
-    seen_timer = not use_ocr_gating
 
-    if use_ocr_gating:
-        job = store.append_job_log(job.id, "Using OCR match-start detection for this source.")
+    if job.source.source_kind == "watchbot":
+        job = store.append_job_log(
+            job.id,
+            "Watchbot clip already trimmed by template start detection; processing immediately from frame 0.",
+        )
     else:
         source_label = {
             "upload": "Upload",
             "youtube": "YouTube",
             "watchbot": "Watchbot",
         }.get(job.source.source_kind, "Source")
-        job = store.append_job_log(job.id, f"{source_label} source detected: starting processing at frame 0 and skipping OCR gating.")
+        job = store.append_job_log(job.id, f"{source_label} source detected: starting processing at frame 0.")
     if image_tracker.enabled:
         job = store.append_job_log(
             job.id,
@@ -610,23 +771,10 @@ def process_job(job: JobRecord, store: TrackingStore) -> MatchRecord:
 
         frame_id += 1
         timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-        timer_value = None
-
-        if use_ocr_gating:
-            timer_value, last_ocr_time = read_match_timer(frame, last_ocr_time)
-            if timer_value is not None:
-                seen_timer = True
-                if timer_value > 0:
-                    match_active = True
-                elif match_active:
-                    break
 
         if timestamp - last_processed_time < frame_interval:
             continue
         last_processed_time = timestamp
-
-        if seen_timer and not match_active:
-            continue
 
         inference_result = model.infer(frame)[0]
         predictions = getattr(inference_result, "predictions", [])
@@ -898,26 +1046,67 @@ def capture_stream_segment(stream_url: str, output_path: str, stop_flag) -> tupl
     if not cap.isOpened():
         return False, "Could not open watchbot stream."
 
+    try:
+        detector = _load_watchbot_start_detector()
+    except FileNotFoundError as exc:
+        cap.release()
+        return False, str(exc)
+
+    source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if source_fps <= 0:
+        source_fps = TARGET_FPS
+    analysis_stride = 1
+    if WATCHBOT_TEMPLATE_ANALYSIS_FPS > 0:
+        analysis_stride = max(1, int(round(source_fps / WATCHBOT_TEMPLATE_ANALYSIS_FPS)))
+    clip_frame_count = max(1, int(round(WATCHBOT_MATCH_DURATION_SECONDS * source_fps)))
+
     writer = None
-    last_ocr_time = 0.0
-    active = False
+    frame_id = 0
+    clip_end_frame: Optional[int] = None
+    captured_any_frames = False
+    positive_streak = 0
+
     while not stop_flag():
         ret, frame = cap.read()
-        if not ret:
+        if not ret or frame is None:
             break
 
-        timer_value, last_ocr_time = read_match_timer(frame, last_ocr_time)
-        if timer_value is not None and timer_value > 0 and not active:
-            active = True
-            height, width, _ = frame.shape
-            writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), TARGET_FPS, (width, height))
-        if active and writer is not None:
-            writer.write(frame)
-        if active and timer_value == 0:
-            break
+        wrote_current_frame = False
+        if frame_id % analysis_stride == 0:
+            start_margin = detector.score_frame(frame)
+            if start_margin >= WATCHBOT_FIELD_TEMPLATE_MARGIN:
+                positive_streak += 1
+            else:
+                positive_streak = 0
+
+            if positive_streak >= WATCHBOT_TEMPLATE_START_FRAMES and writer is None:
+                height, width = frame.shape[:2]
+                writer = cv2.VideoWriter(
+                    output_path,
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    source_fps,
+                    (width, height),
+                )
+                if not writer.isOpened():
+                    cap.release()
+                    return False, f"Could not create watchbot capture file: {output_path}"
+                clip_end_frame = frame_id + clip_frame_count - 1
+                writer.write(frame)
+                captured_any_frames = True
+                wrote_current_frame = True
+
+        if writer is not None:
+            if not wrote_current_frame:
+                writer.write(frame)
+                captured_any_frames = True
+            if clip_end_frame is not None and frame_id >= clip_end_frame:
+                break
+
+        frame_id += 1
 
     cap.release()
     if writer is not None:
         writer.release()
-        return True, output_path
-    return False, "No match segment was detected."
+        if captured_any_frames:
+            return True, output_path
+    return False, "No match segment was detected with template start detection."

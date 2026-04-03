@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 CalibrationMode = Literal["auto_calibration", "manual_override", "blended", "manual_fallback"]
+CalibrationSource = Literal["manual", "apriltag_pose_seeded", "apriltag_homography"]
 JobStatus = Literal["queued", "running", "completed", "failed"]
 SourceKind = Literal["upload", "youtube", "watchbot"]
 ViewName = Literal["left", "main", "right"]
@@ -44,6 +45,10 @@ class FieldLandmark(BaseModel):
     image_point: list[float]
     field_point: list[float]
     confidence: float
+    source_type: Literal["manual", "apriltag"] = "manual"
+    tag_id: Optional[int] = None
+    corner_index: Optional[int] = None
+    decision_margin: Optional[float] = None
 
 
 class ViewCalibration(BaseModel):
@@ -56,6 +61,9 @@ class ViewCalibration(BaseModel):
     distortion_y: float = 0.0
     reprojection_error: Optional[float] = None
     confidence: float = 0.0
+    calibration_source: CalibrationSource = "manual"
+    detected_tag_ids: list[int] = Field(default_factory=list)
+    pose_debug: dict[str, Any] = Field(default_factory=dict)
     fallback_reason: Optional[str] = None
 
 

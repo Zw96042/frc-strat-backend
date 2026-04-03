@@ -15,7 +15,8 @@ import cv2
 import numpy as np
 
 from .calibration import points_form_valid_quad
-from .config import ARTIFACT_ROOT, FUEL_DENSITY_MAP_ROOT, FUEL_FIELD_IMAGE_PATH, FUEL_PROCESSOR_SCRIPT
+from .config import ARTIFACT_ROOT, FUEL_DENSITY_MAP_ROOT, FUEL_FIELD_IMAGE_PATH, FUEL_PROCESSOR_SCRIPT, TARGET_FPS
+from .fuel_builtin import run_builtin_fuel_processor
 from .schemas import FuelArtifactSet, FuelProcessingProgress, MatchRecord, SourceSubmission
 from .storage import TrackingStore
 
@@ -254,11 +255,167 @@ def update_fuel_debug(match: MatchRecord) -> None:
     )
 
 
+def _set_fuel_processing_progress(
+    match: MatchRecord,
+    store: TrackingStore,
+    *,
+    started_at: float,
+    phase: str,
+    current: int,
+    total: int,
+) -> None:
+    now = time.time()
+    match.fuel_analysis.processing_progress = FuelProcessingProgress(
+        phase=phase,
+        current=max(0, int(current)),
+        total=max(1, int(total)),
+        started_at=started_at,
+        updated_at=now,
+    )
+    match.fuel_analysis.updated_at = now
+    update_fuel_debug(match)
+    store.save_match(match)
+
+
+def _set_fuel_analysis_error(
+    match: MatchRecord,
+    store: TrackingStore,
+    message: str,
+    *,
+    artifact_dir: Path,
+) -> None:
+    log_path = artifact_dir / "fuel-process.log"
+    if not log_path.exists():
+        log_path.write_text(f"{message}\n", encoding="utf-8")
+    match.fuel_analysis.status = "error"
+    match.fuel_analysis.last_error = message
+    match.fuel_analysis.processing_progress = None
+    match.fuel_analysis.updated_at = time.time()
+    if log_path.exists():
+        match.fuel_analysis.artifacts.process_log = _artifact_url(match.id, log_path.name)
+    update_fuel_debug(match)
+    store.save_match(match)
+
+
+def _finalize_fuel_analysis(match: MatchRecord, store: TrackingStore, artifact_dir: Path) -> MatchRecord:
+    stats_path = artifact_dir / "stats.json"
+    stats_payload: dict[str, Any] = {}
+    if stats_path.exists():
+        stats_payload = json.loads(stats_path.read_text(encoding="utf-8"))
+
+    log_path = artifact_dir / "fuel-process.log"
+    match.fuel_analysis.status = "completed"
+    match.fuel_analysis.processing_progress = None
+    match.fuel_analysis.last_error = None
+    match.fuel_analysis.updated_at = time.time()
+    match.fuel_analysis.stats = stats_payload
+    match.fuel_analysis.artifacts = FuelArtifactSet(
+        overlay_image=_artifact_url(match.id, "overlay.png") if _artifact_path(match.id, "overlay.png").exists() else None,
+        overlay_transparent_image=(
+            _artifact_url(match.id, "overlay-transparent.png")
+            if _artifact_path(match.id, "overlay-transparent.png").exists()
+            else None
+        ),
+        overlay_video=_artifact_url(match.id, "overlay-video.mp4") if _artifact_path(match.id, "overlay-video.mp4").exists() else None,
+        raw_data=_artifact_url(match.id, "raw_data.txt") if _artifact_path(match.id, "raw_data.txt").exists() else None,
+        field_map=_artifact_url(match.id, "field-map.json") if _artifact_path(match.id, "field-map.json").exists() else None,
+        air_profile=_artifact_url(match.id, "air-profile.json") if _artifact_path(match.id, "air-profile.json").exists() else None,
+        stats_file=_artifact_url(match.id, "stats.json") if stats_path.exists() else None,
+        process_log=_artifact_url(match.id, log_path.name) if log_path.exists() else None,
+    )
+    update_fuel_debug(match)
+    store.save_match(match)
+    return match
+
+
+def _run_external_fuel_processor(
+    *,
+    video_path: str,
+    artifact_dir: Path,
+    bbox: tuple[int, int, int, int],
+    ground_quad_pixels: list[list[float]],
+    left_wall_quad_pixels: Optional[list[list[float]]],
+    right_wall_quad_pixels: Optional[list[list[float]]],
+    fuel_base_color: list[int],
+    match: MatchRecord,
+    store: TrackingStore,
+    started_at: float,
+) -> None:
+    command = [
+        processor_python_bin(),
+        "-u",
+        str(FUEL_PROCESSOR_SCRIPT),
+        "--video",
+        video_path,
+        "--session-dir",
+        str(artifact_dir),
+        "--bbox",
+        ",".join(str(int(value)) for value in bbox),
+        "--quad",
+        ",".join(f"{int(point[0])},{int(point[1])}" for point in ground_quad_pixels),
+        "--overlay-output",
+        "video",
+        "--backend",
+        fuel_processor_backend(),
+        "--field-image",
+        str(FUEL_FIELD_IMAGE_PATH),
+        "--fuel-base-color",
+        ",".join(str(value) for value in fuel_base_color),
+    ]
+    if left_wall_quad_pixels:
+        command.extend(["--wall-quad-left", ",".join(f"{int(point[0])},{int(point[1])}" for point in left_wall_quad_pixels)])
+    if right_wall_quad_pixels:
+        command.extend(["--wall-quad-right", ",".join(f"{int(point[0])},{int(point[1])}" for point in right_wall_quad_pixels)])
+
+    output_lines: list[str] = []
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(FUEL_DENSITY_MAP_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Could not start fuel processor: {exc}") from exc
+
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            output_lines.append(line)
+            if line.startswith(PROGRESS_JSON_PREFIX):
+                try:
+                    payload = json.loads(line[len(PROGRESS_JSON_PREFIX) :].strip())
+                except json.JSONDecodeError:
+                    continue
+                _set_fuel_processing_progress(
+                    match,
+                    store,
+                    started_at=started_at,
+                    phase=str(payload.get("phase") or "frames"),
+                    current=int(payload.get("current") or 0),
+                    total=int(payload.get("total") or 1),
+                )
+        return_code = process.wait()
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+
+    log_path = artifact_dir / "fuel-process.log"
+    log_text = "".join(output_lines).strip()
+    log_path.write_text(f"{log_text}\n" if log_text else "", encoding="utf-8")
+
+    if return_code != 0:
+        error_message = f"Fuel processor exited with code {return_code}."
+        if log_text:
+            error_message = log_text.splitlines()[-1] or error_message
+        raise RuntimeError(error_message)
+
+
 def run_fuel_analysis(match: MatchRecord, store: TrackingStore) -> MatchRecord:
     if not match.fuel_calibration.ground_quad:
         raise RuntimeError("Fuel analysis needs four calibrated ground corners first.")
-    if not FUEL_PROCESSOR_SCRIPT.exists():
-        raise RuntimeError(f"Fuel processor not found at {FUEL_PROCESSOR_SCRIPT}.")
 
     video_path = resolve_match_video_path(match)
     metadata = probe_video_metadata(video_path)
@@ -311,118 +468,48 @@ def run_fuel_analysis(match: MatchRecord, store: TrackingStore) -> MatchRecord:
     match.fuel_analysis.updated_at = started_at
     update_fuel_debug(match)
     store.save_match(match)
-
-    command = [
-        processor_python_bin(),
-        "-u",
-        str(FUEL_PROCESSOR_SCRIPT),
-        "--video",
-        video_path,
-        "--session-dir",
-        str(artifact_dir),
-        "--bbox",
-        ",".join(str(int(value)) for value in bbox),
-        "--quad",
-        ",".join(f"{int(point[0])},{int(point[1])}" for point in ground_quad_pixels),
-        "--overlay-output",
-        "video",
-        "--backend",
-        fuel_processor_backend(),
-        "--field-image",
-        str(FUEL_FIELD_IMAGE_PATH),
-        "--fuel-base-color",
-        ",".join(str(value) for value in fuel_base_color),
-    ]
-    if left_wall_quad_pixels:
-        command.extend(["--wall-quad-left", ",".join(f"{int(point[0])},{int(point[1])}" for point in left_wall_quad_pixels)])
-    if right_wall_quad_pixels:
-        command.extend(["--wall-quad-right", ",".join(f"{int(point[0])},{int(point[1])}" for point in right_wall_quad_pixels)])
-
-    output_lines: list[str] = []
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=str(FUEL_DENSITY_MAP_ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-    except FileNotFoundError as exc:
-        match.fuel_analysis.status = "error"
-        match.fuel_analysis.last_error = f"Could not start fuel processor: {exc}"
-        match.fuel_analysis.processing_progress = None
-        match.fuel_analysis.updated_at = time.time()
-        update_fuel_debug(match)
-        store.save_match(match)
-        raise RuntimeError(match.fuel_analysis.last_error) from exc
+        if FUEL_PROCESSOR_SCRIPT.exists():
+            _run_external_fuel_processor(
+                video_path=video_path,
+                artifact_dir=artifact_dir,
+                bbox=bbox,
+                ground_quad_pixels=ground_quad_pixels,
+                left_wall_quad_pixels=left_wall_quad_pixels,
+                right_wall_quad_pixels=right_wall_quad_pixels,
+                fuel_base_color=fuel_base_color,
+                match=match,
+                store=store,
+                started_at=started_at,
+            )
+        else:
+            progress_interval = 12
 
-    try:
-        assert process.stdout is not None
-        for line in process.stdout:
-            output_lines.append(line)
-            if line.startswith(PROGRESS_JSON_PREFIX):
-                try:
-                    payload = json.loads(line[len(PROGRESS_JSON_PREFIX) :].strip())
-                except json.JSONDecodeError:
-                    continue
-                now = time.time()
-                match.fuel_analysis.processing_progress = FuelProcessingProgress(
-                    phase=str(payload.get("phase") or "frames"),
-                    current=int(payload.get("current") or 0),
-                    total=max(1, int(payload.get("total") or 1)),
+            def builtin_progress(phase: str, current: int, total: int) -> None:
+                if current not in {0, total} and current % progress_interval != 0:
+                    return
+                _set_fuel_processing_progress(
+                    match,
+                    store,
                     started_at=started_at,
-                    updated_at=now,
+                    phase=phase,
+                    current=current,
+                    total=total,
                 )
-                match.fuel_analysis.updated_at = now
-                update_fuel_debug(match)
-                store.save_match(match)
-        return_code = process.wait()
-    finally:
-        if process.stdout is not None:
-            process.stdout.close()
 
-    log_path = artifact_dir / "fuel-process.log"
-    log_text = "".join(output_lines).strip()
-    log_path.write_text(f"{log_text}\n" if log_text else "", encoding="utf-8")
+            run_builtin_fuel_processor(
+                video_path=video_path,
+                artifact_dir=artifact_dir,
+                field_image_path=FUEL_FIELD_IMAGE_PATH,
+                ground_quad_pixels=ground_quad_pixels,
+                left_wall_quad_pixels=left_wall_quad_pixels,
+                right_wall_quad_pixels=right_wall_quad_pixels,
+                fuel_base_color=fuel_base_color,
+                analysis_fps=float(max(1.0, TARGET_FPS)),
+                progress_callback=builtin_progress,
+            )
+    except Exception as exc:
+        _set_fuel_analysis_error(match, store, str(exc), artifact_dir=artifact_dir)
+        raise RuntimeError(str(exc)) from exc
 
-    if return_code != 0:
-        error_message = f"Fuel processor exited with code {return_code}."
-        if log_text:
-            error_message = log_text.splitlines()[-1] or error_message
-        match.fuel_analysis.status = "error"
-        match.fuel_analysis.last_error = error_message
-        match.fuel_analysis.processing_progress = None
-        match.fuel_analysis.updated_at = time.time()
-        match.fuel_analysis.artifacts.process_log = _artifact_url(match.id, log_path.name)
-        update_fuel_debug(match)
-        store.save_match(match)
-        raise RuntimeError(error_message)
-
-    stats_path = artifact_dir / "stats.json"
-    stats_payload: dict[str, Any] = {}
-    if stats_path.exists():
-        stats_payload = json.loads(stats_path.read_text(encoding="utf-8"))
-
-    match.fuel_analysis.status = "completed"
-    match.fuel_analysis.processing_progress = None
-    match.fuel_analysis.last_error = None
-    match.fuel_analysis.updated_at = time.time()
-    match.fuel_analysis.stats = stats_payload
-    match.fuel_analysis.artifacts = FuelArtifactSet(
-        overlay_image=_artifact_url(match.id, "overlay.png") if _artifact_path(match.id, "overlay.png").exists() else None,
-        overlay_transparent_image=(
-            _artifact_url(match.id, "overlay-transparent.png")
-            if _artifact_path(match.id, "overlay-transparent.png").exists()
-            else None
-        ),
-        overlay_video=_artifact_url(match.id, "overlay-video.mp4") if _artifact_path(match.id, "overlay-video.mp4").exists() else None,
-        raw_data=_artifact_url(match.id, "raw_data.txt") if _artifact_path(match.id, "raw_data.txt").exists() else None,
-        field_map=_artifact_url(match.id, "field-map.json") if _artifact_path(match.id, "field-map.json").exists() else None,
-        air_profile=_artifact_url(match.id, "air-profile.json") if _artifact_path(match.id, "air-profile.json").exists() else None,
-        stats_file=_artifact_url(match.id, "stats.json") if stats_path.exists() else None,
-        process_log=_artifact_url(match.id, log_path.name),
-    )
-    update_fuel_debug(match)
-    store.save_match(match)
-    return match
+    return _finalize_fuel_analysis(match, store, artifact_dir)

@@ -231,11 +231,20 @@ def order_quad_points(points: list[list[float]], invert_y: bool = False) -> list
     return [list(points[index]) for index in order_quad_indices(points, invert_y=invert_y)]
 
 
-def field_points_form_valid_quad(points: list[list[float]]) -> bool:
-    return points_form_valid_quad(points)
+def field_points_form_valid_quad(
+    points: list[list[float]],
+    min_area_floor: float = 100.0,
+    min_area_ratio: float = 0.05,
+) -> bool:
+    return points_form_valid_quad(points, min_area_floor=min_area_floor, min_area_ratio=min_area_ratio)
 
 
-def image_landmarks_form_valid_quad(roi: list[float], landmarks: list[FieldLandmark]) -> bool:
+def image_landmarks_form_valid_quad(
+    roi: list[float],
+    landmarks: list[FieldLandmark],
+    min_area_floor: float = 100.0,
+    min_area_ratio: float = 0.05,
+) -> bool:
     if len(roi) < 4 or len(landmarks) < 4:
         return False
 
@@ -251,7 +260,7 @@ def image_landmarks_form_valid_quad(roi: list[float], landmarks: list[FieldLandm
             return False
         relative_points.append([point_x - x1, point_y - y1])
 
-    return points_form_valid_quad(relative_points)
+    return points_form_valid_quad(relative_points, min_area_floor=min_area_floor, min_area_ratio=min_area_ratio)
 
 
 def upgrade_legacy_landmarks(view_name: str, landmarks: list[FieldLandmark]) -> list[FieldLandmark]:
@@ -327,6 +336,7 @@ def load_default_calibration(file_path: Optional[Union[Path, str]] = None) -> Ca
                 landmarks=landmarks,
                 reprojection_error=error,
                 confidence=0.42,
+                calibration_source="manual",
                 fallback_reason="Seeded from manual calibration file until the 2026 landmark model is trained.",
             )
         )
