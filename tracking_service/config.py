@@ -13,6 +13,7 @@ JOB_ROOT = DATA_ROOT / "jobs"
 WATCHBOT_ROOT = DATA_ROOT / "watchbot"
 ARTIFACT_ROOT = DATA_ROOT / "artifacts"
 CALIBRATION_PRESET_ROOT = DATA_ROOT / "calibrations"
+FUEL_CALIBRATION_PRESET_ROOT = DATA_ROOT / "fuel_calibrations"
 
 
 def _resolve_default_calibration_file() -> Path:
@@ -114,5 +115,6 @@ def ensure_data_dirs() -> None:
         WATCHBOT_ROOT,
         ARTIFACT_ROOT,
         CALIBRATION_PRESET_ROOT,
+        FUEL_CALIBRATION_PRESET_ROOT,
     ):
         path.mkdir(parents=True, exist_ok=True)

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -238,9 +239,190 @@ def processor_python_bin() -> str:
     return shutil.which("python3") or shutil.which("python") or "python"
 
 
+@lru_cache(maxsize=4)
+def _processor_python_supports_cuda(python_bin: str) -> bool:
+    command = [
+        python_bin,
+        "-c",
+        (
+            "import cv2, sys; "
+            "count = -1; "
+            "try:\n"
+            "    count = int(cv2.cuda.getCudaEnabledDeviceCount())\n"
+            "except Exception:\n"
+            "    count = -1\n"
+            "sys.stdout.write(str(count))"
+        ),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        return False
+
+    if result.returncode != 0:
+        return False
+
+    try:
+        return int((result.stdout or "").strip() or "-1") > 0
+    except ValueError:
+        return False
+
+
 def fuel_processor_backend() -> str:
-    value = str(os.getenv("FUEL_PROCESSOR_BACKEND", "cpu")).strip().lower()
-    return value if value in {"cpu", "cuda"} else "cpu"
+    value = str(os.getenv("FUEL_PROCESSOR_BACKEND", "")).strip().lower()
+    if value in {"cpu", "cuda"}:
+        return value
+
+    override = os.getenv("FUEL_PROCESSOR_PYTHON_BIN", "").strip()
+    if override and _processor_python_supports_cuda(override):
+        return "cuda"
+
+    cuda_candidate = FUEL_DENSITY_MAP_ROOT / ".venv-opencv-cuda" / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
+    if cuda_candidate.exists() and _processor_python_supports_cuda(str(cuda_candidate)):
+        return "cuda"
+    return "cpu"
+
+
+def fuel_processor_overlay_output() -> str:
+    value = str(os.getenv("FUEL_PROCESSOR_OVERLAY_OUTPUT", "none")).strip().lower()
+    return value if value in {"video", "frames", "none"} else "none"
+
+
+def fuel_processor_target_height() -> int:
+    try:
+        value = int(str(os.getenv("FUEL_PROCESSOR_TARGET_HEIGHT", "720")).strip() or "720")
+    except ValueError:
+        value = 720
+    return max(0, value)
+
+
+def external_fuel_processor_enabled() -> bool:
+    value = str(os.getenv("FUEL_PROCESSOR_DISABLE_EXTERNAL", "")).strip().lower()
+    return value not in {"1", "true", "yes", "on"}
+
+
+def external_fuel_processor_fallback_enabled() -> bool:
+    value = str(os.getenv("FUEL_PROCESSOR_DISABLE_BUILTIN_FALLBACK", "")).strip().lower()
+    return value not in {"1", "true", "yes", "on"}
+
+
+def _cleanup_fuel_outputs(
+    artifact_dir: Path,
+    *,
+    preserve_external_log: bool = False,
+    preserve_scaled_input: bool = False,
+) -> None:
+    generated_names = [
+        "overlay.png",
+        "overlay-transparent.png",
+        "raw_data.txt",
+        "field-map.json",
+        "air-profile.json",
+        "stats.json",
+        "fuel-process.log",
+    ]
+    if not preserve_external_log:
+        generated_names.append("fuel-process-external.log")
+    optional_generated_names = [
+        "overlay-video.mp4",
+    ]
+    generated_patterns = [
+        "field-frames-*.jsonpart",
+        "air-profile-*.jsonpart",
+    ]
+    if not preserve_scaled_input:
+        generated_patterns.append("fuel_input_*p.mp4")
+    generated_dirs = [
+        "overlay-frames",
+    ]
+
+    for name in generated_names + optional_generated_names:
+        path = artifact_dir / name
+        if path.exists():
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+
+    for pattern in generated_patterns:
+        for path in artifact_dir.glob(pattern):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+
+    for name in generated_dirs:
+        path = artifact_dir / name
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def _meaningful_fuel_error_line(log_lines: list[str], default_message: str) -> str:
+    ignored_prefixes = (
+        PROGRESS_JSON_PREFIX,
+        "Processing sampled frame ",
+    )
+    ignored_exact = {
+        "Processing video...",
+    }
+    for line in reversed([entry.strip() for entry in log_lines if entry.strip()]):
+        if line in ignored_exact:
+            continue
+        if any(line.startswith(prefix) for prefix in ignored_prefixes):
+            continue
+        return line
+    return default_message
+
+
+def _transcode_fuel_video_input(input_path: str, output_path: Path, target_height: int) -> str:
+    backend = fuel_processor_backend()
+    base_command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-vf",
+        f"scale=-2:{int(target_height)}",
+        "-an",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+    ]
+    commands = []
+    if backend == "cuda":
+        commands.append(base_command + ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "28", str(output_path)])
+    commands.append(base_command + ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", str(output_path)])
+
+    for command in commands:
+        try:
+            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return str(output_path)
+        except Exception:
+            continue
+    return input_path
+
+
+def prepare_fuel_video_input(video_path: str, artifact_dir: Path) -> str:
+    target_height = fuel_processor_target_height()
+    if target_height <= 0:
+        return video_path
+
+    metadata = probe_video_metadata(video_path)
+    height = int(metadata["height"])
+    if height <= 0 or height <= target_height:
+        return video_path
+
+    output_path = artifact_dir / f"fuel_input_{target_height}p.mp4"
+    if output_path.exists() and output_path.stat().st_size > 0:
+        return str(output_path)
+    return _transcode_fuel_video_input(video_path, output_path, target_height)
 
 
 def update_fuel_debug(match: MatchRecord) -> None:
@@ -354,7 +536,7 @@ def _run_external_fuel_processor(
         "--quad",
         ",".join(f"{int(point[0])},{int(point[1])}" for point in ground_quad_pixels),
         "--overlay-output",
-        "video",
+        fuel_processor_overlay_output(),
         "--backend",
         fuel_processor_backend(),
         "--field-image",
@@ -408,8 +590,8 @@ def _run_external_fuel_processor(
 
     if return_code != 0:
         error_message = f"Fuel processor exited with code {return_code}."
-        if log_text:
-            error_message = log_text.splitlines()[-1] or error_message
+        if output_lines:
+            error_message = _meaningful_fuel_error_line(output_lines, error_message)
         raise RuntimeError(error_message)
 
 
@@ -417,7 +599,9 @@ def run_fuel_analysis(match: MatchRecord, store: TrackingStore) -> MatchRecord:
     if not match.fuel_calibration.ground_quad:
         raise RuntimeError("Fuel analysis needs four calibrated ground corners first.")
 
-    video_path = resolve_match_video_path(match)
+    artifact_dir = store.create_match_artifact_dir(match.id)
+    _cleanup_fuel_outputs(artifact_dir)
+    video_path = prepare_fuel_video_input(resolve_match_video_path(match), artifact_dir)
     metadata = probe_video_metadata(video_path)
     width = max(1, int(metadata["width"]))
     height = max(1, int(metadata["height"]))
@@ -436,25 +620,6 @@ def run_fuel_analysis(match: MatchRecord, store: TrackingStore) -> MatchRecord:
     )
     fuel_base_color = normalize_rgb_color(match.fuel_calibration.fuel_base_color) or list(DEFAULT_FUEL_BASE_COLOR)
 
-    artifact_dir = store.create_match_artifact_dir(match.id)
-    generated_names = [
-        "overlay-video.mp4",
-        "overlay.png",
-        "overlay-transparent.png",
-        "raw_data.txt",
-        "field-map.json",
-        "air-profile.json",
-        "stats.json",
-        "fuel-process.log",
-    ]
-    for name in generated_names:
-        path = artifact_dir / name
-        if path.exists():
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                path.unlink(missing_ok=True)
-
     started_at = time.time()
     clear_fuel_artifacts(match)
     match.fuel_analysis.status = "processing"
@@ -469,47 +634,63 @@ def run_fuel_analysis(match: MatchRecord, store: TrackingStore) -> MatchRecord:
     update_fuel_debug(match)
     store.save_match(match)
     try:
-        if FUEL_PROCESSOR_SCRIPT.exists():
-            _run_external_fuel_processor(
-                video_path=video_path,
-                artifact_dir=artifact_dir,
-                bbox=bbox,
-                ground_quad_pixels=ground_quad_pixels,
-                left_wall_quad_pixels=left_wall_quad_pixels,
-                right_wall_quad_pixels=right_wall_quad_pixels,
-                fuel_base_color=fuel_base_color,
-                match=match,
-                store=store,
+        progress_interval = 12
+
+        def builtin_progress(phase: str, current: int, total: int) -> None:
+            if current not in {0, total} and current % progress_interval != 0:
+                return
+            _set_fuel_processing_progress(
+                match,
+                store,
                 started_at=started_at,
+                phase=phase,
+                current=current,
+                total=total,
             )
-        else:
-            progress_interval = 12
 
-            def builtin_progress(phase: str, current: int, total: int) -> None:
-                if current not in {0, total} and current % progress_interval != 0:
-                    return
-                _set_fuel_processing_progress(
-                    match,
-                    store,
+        external_error: Exception | None = None
+        if FUEL_PROCESSOR_SCRIPT.exists() and external_fuel_processor_enabled():
+            try:
+                _run_external_fuel_processor(
+                    video_path=video_path,
+                    artifact_dir=artifact_dir,
+                    bbox=bbox,
+                    ground_quad_pixels=ground_quad_pixels,
+                    left_wall_quad_pixels=left_wall_quad_pixels,
+                    right_wall_quad_pixels=right_wall_quad_pixels,
+                    fuel_base_color=fuel_base_color,
+                    match=match,
+                    store=store,
                     started_at=started_at,
-                    phase=phase,
-                    current=current,
-                    total=total,
                 )
+            except Exception as exc:
+                external_error = exc
+                external_log = artifact_dir / "fuel-process.log"
+                archived_external_log = artifact_dir / "fuel-process-external.log"
+                if external_log.exists():
+                    external_log.replace(archived_external_log)
+                if not external_fuel_processor_fallback_enabled():
+                    raise
+                _cleanup_fuel_outputs(artifact_dir, preserve_external_log=True, preserve_scaled_input=True)
+                match.debug.setdefault("fuel", {})
+                match.debug["fuel"]["external_failure"] = str(exc)
+                store.save_match(match)
 
-            run_builtin_fuel_processor(
-                video_path=video_path,
-                artifact_dir=artifact_dir,
-                field_image_path=FUEL_FIELD_IMAGE_PATH,
-                ground_quad_pixels=ground_quad_pixels,
-                left_wall_quad_pixels=left_wall_quad_pixels,
-                right_wall_quad_pixels=right_wall_quad_pixels,
-                fuel_base_color=fuel_base_color,
-                analysis_fps=float(max(1.0, TARGET_FPS)),
-                progress_callback=builtin_progress,
-            )
+        if external_error is None and FUEL_PROCESSOR_SCRIPT.exists() and external_fuel_processor_enabled():
+            return _finalize_fuel_analysis(match, store, artifact_dir)
+
+        run_builtin_fuel_processor(
+            video_path=video_path,
+            artifact_dir=artifact_dir,
+            field_image_path=FUEL_FIELD_IMAGE_PATH,
+            ground_quad_pixels=ground_quad_pixels,
+            left_wall_quad_pixels=left_wall_quad_pixels,
+            right_wall_quad_pixels=right_wall_quad_pixels,
+            fuel_base_color=fuel_base_color,
+            analysis_fps=float(max(1.0, TARGET_FPS)),
+            progress_callback=builtin_progress,
+        )
     except Exception as exc:
         _set_fuel_analysis_error(match, store, str(exc), artifact_dir=artifact_dir)
         raise RuntimeError(str(exc)) from exc
-
     return _finalize_fuel_analysis(match, store, artifact_dir)

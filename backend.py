@@ -32,6 +32,8 @@ from tracking_service.pipeline import process_job, rebuild_match_tracking, resol
 from tracking_service.schemas import (
     CalibrationEnvelope,
     CalibrationPreset,
+    FuelCalibrationPreset,
+    FuelCalibration,
     FieldLandmark,
     MatchArtifactSet,
     MatchLabelUpdate,
@@ -438,6 +440,31 @@ async def create_calibration_preset(payload: dict) -> dict:
         calibration=CalibrationEnvelope.model_validate(calibration_payload),
     )
     store.save_calibration_preset(preset)
+    return {"preset": preset.model_dump()}
+
+
+@app.get("/fuel-calibration-presets")
+async def list_fuel_calibration_presets() -> list[dict]:
+    return [preset.model_dump() for preset in store.list_fuel_calibration_presets()]
+
+
+@app.post("/fuel-calibration-presets")
+async def create_fuel_calibration_preset(payload: dict) -> dict:
+    name = str(payload.get("name") or "").strip()
+    calibration_payload = payload.get("fuel_calibration")
+    if not name:
+        raise HTTPException(status_code=400, detail="Fuel calibration preset name is required.")
+    if not isinstance(calibration_payload, dict):
+        raise HTTPException(status_code=400, detail="Fuel calibration preset requires a fuel_calibration payload.")
+
+    preset = FuelCalibrationPreset(
+        id=uuid.uuid4().hex,
+        name=name,
+        created_at=time.time(),
+        updated_at=time.time(),
+        fuel_calibration=FuelCalibration.model_validate(calibration_payload),
+    )
+    store.save_fuel_calibration_preset(preset)
     return {"preset": preset.model_dump()}
 
 

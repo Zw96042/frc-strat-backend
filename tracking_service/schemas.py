@@ -125,6 +125,14 @@ class FuelCalibration(BaseModel):
     updated_at: Optional[float] = None
 
 
+class FuelCalibrationPreset(BaseModel):
+    id: str
+    name: str
+    created_at: float
+    updated_at: float
+    fuel_calibration: FuelCalibration
+
+
 class FuelArtifactSet(BaseModel):
     overlay_image: Optional[str] = None
     overlay_transparent_image: Optional[str] = None

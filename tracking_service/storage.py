@@ -7,8 +7,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from .config import ARTIFACT_ROOT, CALIBRATION_PRESET_ROOT, JOB_ROOT, MATCH_ROOT, UPLOAD_ROOT, WATCHBOT_ROOT, ensure_data_dirs
-from .schemas import CalibrationPreset, JobLogEntry, JobRecord, MatchRecord, SourceSubmission, WatchbotState
+from .config import ARTIFACT_ROOT, CALIBRATION_PRESET_ROOT, FUEL_CALIBRATION_PRESET_ROOT, JOB_ROOT, MATCH_ROOT, UPLOAD_ROOT, WATCHBOT_ROOT, ensure_data_dirs
+from .schemas import CalibrationPreset, FuelCalibrationPreset, JobLogEntry, JobRecord, MatchRecord, SourceSubmission, WatchbotState
 
 
 class TrackingStore:
@@ -26,6 +26,9 @@ class TrackingStore:
 
     def _calibration_preset_path(self, preset_id: str) -> Path:
         return CALIBRATION_PRESET_ROOT / f"{preset_id}.json"
+
+    def _fuel_calibration_preset_path(self, preset_id: str) -> Path:
+        return FUEL_CALIBRATION_PRESET_ROOT / f"{preset_id}.json"
 
     def save_upload(self, source_name: str, data: bytes) -> tuple[str, str]:
         ext = Path(source_name).suffix or ".mp4"
@@ -112,6 +115,18 @@ class TrackingStore:
 
     def list_calibration_presets(self) -> list[CalibrationPreset]:
         presets = [CalibrationPreset.model_validate_json(path.read_text()) for path in CALIBRATION_PRESET_ROOT.glob("*.json")]
+        presets.sort(key=lambda item: item.updated_at, reverse=True)
+        return presets
+
+    def save_fuel_calibration_preset(self, preset: FuelCalibrationPreset) -> None:
+        preset.updated_at = time.time()
+        self._fuel_calibration_preset_path(preset.id).write_text(preset.model_dump_json(indent=2))
+
+    def load_fuel_calibration_preset(self, preset_id: str) -> FuelCalibrationPreset:
+        return FuelCalibrationPreset.model_validate_json(self._fuel_calibration_preset_path(preset_id).read_text())
+
+    def list_fuel_calibration_presets(self) -> list[FuelCalibrationPreset]:
+        presets = [FuelCalibrationPreset.model_validate_json(path.read_text()) for path in FUEL_CALIBRATION_PRESET_ROOT.glob("*.json")]
         presets.sort(key=lambda item: item.updated_at, reverse=True)
         return presets
 

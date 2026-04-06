@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass
 from functools import lru_cache
@@ -530,7 +531,7 @@ def build_topdown_snapshot(tracks: list[TrackRecord], output_path: Path) -> None
     cv2.imwrite(str(output_path), image)
 
 
-def transcode_annotated_video(input_path: Path, output_path: Path) -> Path:
+def transcode_browser_video(input_path: Path, output_path: Path) -> Path:
     command = [
         "ffmpeg",
         "-y",
@@ -538,8 +539,13 @@ def transcode_annotated_video(input_path: Path, output_path: Path) -> Path:
         str(input_path),
         "-c:v",
         "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "28",
         "-pix_fmt",
         "yuv420p",
+        "-an",
         "-movflags",
         "+faststart",
         str(output_path),
@@ -549,6 +555,10 @@ def transcode_annotated_video(input_path: Path, output_path: Path) -> Path:
         return output_path
     except Exception:
         return input_path
+
+
+def transcode_annotated_video(input_path: Path, output_path: Path) -> Path:
+    return transcode_browser_video(input_path, output_path)
 
 
 def rebuild_match_tracking(match: MatchRecord, store: TrackingStore) -> MatchRecord:
@@ -715,7 +725,10 @@ def process_job(job: JobRecord, store: TrackingStore) -> MatchRecord:
     artifact_dir = store.create_match_artifact_dir(match.id)
     copied_source = store.copy_into_artifacts(job.source.stored_path, match.id, "source") if job.source.stored_path else None
     if copied_source:
-        match.artifacts.source_video = copied_source
+        copied_source_path = artifact_dir / Path(urllib.parse.unquote(copied_source.split(f"/artifacts/{match.id}/", 1)[-1])).name
+        job = store.append_job_log(job.id, "Transcoding browser-safe source video.")
+        browser_source_path = transcode_browser_video(copied_source_path, artifact_dir / "source_browser.mp4")
+        match.artifacts.source_video = f"/artifacts/{match.id}/{browser_source_path.name}"
     elif match.artifacts.source_video is None and resolved.video_path.startswith("http"):
         match.artifacts.source_video = resolved.video_path
 
@@ -984,11 +997,13 @@ def process_job(job: JobRecord, store: TrackingStore) -> MatchRecord:
     cap.release()
     writer.release()
 
+    job = store.append_job_log(job.id, "Transcoding browser-safe annotated video.")
     browser_annotated_path = transcode_annotated_video(annotated_path, artifact_dir / "annotated_browser.mp4")
     match.artifacts.annotated_video = f"/artifacts/{match.id}/{browser_annotated_path.name}"
     if match.artifacts.source_video is None:
         match.artifacts.source_video = match.artifacts.annotated_video
 
+    job = store.append_job_log(job.id, "Building top-down snapshot and final artifacts.")
     topdown_path = artifact_dir / "topdown.png"
     build_topdown_snapshot(match.tracks, topdown_path)
     match.artifacts.topdown_replay = f"/artifacts/{match.id}/{topdown_path.name}"
